@@ -174,7 +174,7 @@ register_env(){
   echo "[OK] 정책 및 연결 완료 (${POLICY})"
 
   REGION=$(aws configure get region || echo "ap-northeast-2")
-  FIREHOSE_NAME=$(aws firehose list-delivery-streams --region "$REGION" --query 'deliveryStreamNames[0]' --output text 2>/dev/null)
+  FIREHOSE_NAME=$(aws firehose list-delivery-streams --region "$REGION" --query 'DeliveryStreamNames[0]' --output text 2>/dev/null)
 
   if [ "$FIREHOSE_NAME" = "None" ] || [ -z "$FIREHOSE_NAME" ]; then
     echo "[WARN] Firehose 스트림이 없습니다. 콘솔에서 미리 생성하세요. (예: PUT-S3-ieDa3)"
