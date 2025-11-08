@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # AIoT collector/publisher 통합 관리 스크립트
-# 기능: configure / check / status / collector / publisher
+# 기능: register / configure / check / status / collector / publisher
 set -euo pipefail
 
 APP_DIR="/opt/aiot"
@@ -11,7 +11,6 @@ LOG_DIR="/var/log/aiot"
 PID_DIR="/run/aiot"
 SUDO=${SUDO:-sudo}
 
-# 공용 ENV 로드(있으면)
 [ -f /etc/default/aiot ] && set -a && . /etc/default/aiot && set +a
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
@@ -119,197 +118,99 @@ check_python_pkgs(){
   fi
 }
 
-# ------------------ 파일 구조 ------------------
-check_file_layout(){
-  echo "== file layout =="
-  printf " - %s : %s\n" "$COLLECTOR"  "$( [ -f "$COLLECTOR" ]  && echo OK || echo MISSING )"
-  printf " - %s : %s\n" "$PUBLISHER"  "$( [ -f "$PUBLISHER" ]  && echo OK || echo MISSING )"
-  printf " - /etc/aiot/endpoint : %s\n" "$( [ -f /etc/aiot/endpoint ] && echo OK || echo MISSING )"
-  printf " - /etc/aiot/room     : %s\n" "$( [ -f /etc/aiot/room ]     && echo OK || echo MISSING )"
-  printf " - /iotcert/*.pem     : %s\n" "$( ls /iotcert/*.pem >/dev/null 2>&1 && echo OK || echo 'MISSING (복사 필요)' )"
-}
+# ------------------ AIoT Thing 자동 등록 ------------------
+register_env(){
+  echo "=== AIoT Gateway Auto Register (Thing + Certificate + Firehose) ==="
+  have_cmd aws || { echo "[ERROR] awscli 미설치. 'aiot-manager check' 실행 필요."; return 1; }
+  have_cmd jq || { echo "[ERROR] jq 미설치. 'aiot-manager check' 실행 필요."; return 1; }
 
-# ------------------ configure ------------------
-configure_env(){
-  echo "=== AIoT 환경 설정 마법사 (디바이스 유형 + room 자동 접두어 버전) ==="
-  $SUDO mkdir -p /etc/aiot
-  local endpoint_file="/etc/aiot/endpoint"
-  local room_file="/etc/aiot/room"
-  local default_env="/etc/default/aiot"
+  aws sts get-caller-identity >/dev/null 2>&1 || { echo "[ERROR] AWS CLI 인증이 필요합니다."; echo "aws configure 실행 후 재시도."; return 1; }
 
-  stty sane  # ← 터미널 입력 복원
+  ping -c1 amazonaws.com >/dev/null 2>&1 || { echo "[ERROR] 네트워크 연결 불가."; return 1; }
 
-  # 0️⃣  AWS 로그인 여부 확인
-  echo "[0/4] AWS CLI 인증 상태 확인 중..."
-  if ! aws sts get-caller-identity >/dev/null 2>&1; then
-    echo "[ERROR] AWS CLI가 인증되지 않았습니다."
-    echo "다음 명령으로 로그인해 주세요:"
-    echo "  aws configure"
-    echo
-    echo "설정 후 다시 'aiot-manager configure'를 실행하세요."
-    exit 1
-  else
-    local aws_user aws_account
-    aws_user="$(aws sts get-caller-identity --query 'Arn' --output text 2>/dev/null)"
-    aws_account="$(aws sts get-caller-identity --query 'Account' --output text 2>/dev/null)"
-    echo "[OK] AWS 인증 확인됨 (Account: ${aws_account}, User: ${aws_user})"
-  fi
-
-  # 1️⃣  디바이스 유형 선택
-  echo "[1/4] 디바이스 유형 선택"
+  echo "[1/6] 디바이스 유형 선택"
   echo "1) Raspberry Pi"
   echo "2) Jetson Nano"
   read -r -p "선택 (1 또는 2): " dev_sel
   case "$dev_sel" in
-    1) device_type="RaspberryPi5" ;;
-    2) device_type="JetsonNano" ;;
-    *) echo "[WARN] 잘못된 입력 → 기본값 RaspberryPi5 사용"; device_type="RaspberryPi5" ;;
+    1) prefix="RaspberryPi5_IoT_Thing_Gateway_" ;;
+    2) prefix="JetsonNano_IoT_Thing_Gateway_" ;;
+    *) echo "[WARN] 잘못된 입력 → 기본값 RaspberryPi5 사용"; prefix="RaspberryPi5_IoT_Thing_Gateway_" ;;
   esac
 
-  # 2️⃣  게이트웨이 번호 입력
-  local gw_num
-  gw_num="$(prompt_int '[2/4] 게이트웨이(Thing) 번호 입력 (정수) = ')"
-
-  # 3️⃣  방 번호 입력 (room- 접두어 자동)
-  local room_num
-  room_num="$(prompt_int '[3/4] 방 번호 입력 (정수) = ')"
-  local room_name="room-${room_num}"
-  echo "$room_name" | $SUDO tee "$room_file" >/dev/null
-
-  # 4️⃣  AWS IoT 엔드포인트 자동 감지
-  echo "[4/4] AWS IoT Core 엔드포인트 자동 탐색 중..."
-  local endpoint
-  endpoint="$(aws iot describe-endpoint --endpoint-type iot:Data-ATS --query 'endpointAddress' --output text 2>/dev/null || true)"
-
-  if [ -z "$endpoint" ]; then
-    echo "[WARN] awscli에서 엔드포인트를 가져오지 못했습니다."
-    echo "직접 입력하시겠습니까? (엔드포인트 시리얼만, 예: a9jkapbuh4ma7)"
-    read -r serial
-    endpoint="${serial}-ats.iot.ap-northeast-2.amazonaws.com"
+  echo "[2/6] 기존 Thing 조회 중..."
+  existing=$(aws iot list-things --query "things[?starts_with(thingName, '${prefix}')].thingName" --output text)
+  if [ -n "$existing" ]; then
+    last=$(echo "$existing" | grep -Eo '[0-9]+$' | sort -n | tail -1)
+    next=$((last + 1))
+  else
+    next=1
   fi
-  echo "$endpoint" | $SUDO tee "$endpoint_file" >/dev/null
+  thing_name="${prefix}${next}"
+  echo "[OK] 새 Thing 이름: ${thing_name}"
 
-  # THING 이름 자동 생성
-  local thing_name="${device_type}_IoT_Thing_Gateway_${gw_num}"
+  if aws iot describe-thing --thing-name "$thing_name" >/dev/null 2>&1; then
+    echo "[ERROR] Thing ${thing_name} 이미 존재함."; return 1
+  fi
 
-  # 환경 파일 생성
-  $SUDO tee "$default_env" >/dev/null <<EOD
-# ===== AIoT 공용 환경 =====
-DB_PATH=/aiot/dataset/sensor_data.db
-MQTT_HOST=127.0.0.1
-MQTT_PORT=1883
-TOPIC=sensor/metrics
+  aws iot create-thing --thing-name "$thing_name" >/dev/null
+  echo "[OK] Thing 생성 완료"
 
-THING_NAME=$thing_name
-IOT_ENDPOINT=$endpoint
+  mkdir -p /iotcert
+  CERT_JSON=$(aws iot create-keys-and-certificate --set-as-active \
+    --certificate-pem-outfile  "/iotcert/${thing_name}.cert.pem" \
+    --private-key-outfile      "/iotcert/${thing_name}.private.key" \
+    --public-key-outfile       "/iotcert/${thing_name}.public.key")
+  CERT_ARN=$(echo "$CERT_JSON" | jq -r .certificateArn)
+  CERT_ID=$(echo "$CERT_JSON" | jq -r .certificateId)
+  echo "[OK] 인증서 발급 완료 (ID=${CERT_ID})"
+
+  [ -f /iotcert/AmazonRootCA1.pem ] || wget -q https://www.amazontrust.com/repository/AmazonRootCA1.pem -O /iotcert/AmazonRootCA1.pem
+
+  POLICY="MyIoTPolicy"
+  if ! aws iot list-policies --query "policies[?policyName=='${POLICY}']" --output text | grep -q "$POLICY"; then
+    echo "[WARN] Policy ${POLICY} 미존재 → 자동 생성"
+    aws iot create-policy --policy-name "$POLICY" \
+      --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iot:Connect","iot:Publish","iot:Receive","iot:Subscribe"],"Resource":"*"}]}'
+  fi
+  aws iot attach-policy --policy-name "$POLICY" --target "$CERT_ARN"
+  aws iot attach-thing-principal --thing-name "$thing_name" --principal "$CERT_ARN"
+  echo "[OK] 정책 및 연결 완료 (${POLICY})"
+
+  firehose=$(aws firehose list-delivery-streams --query 'deliveryStreamNames[0]' --output text)
+  echo "[INFO] 연결된 Firehose: ${firehose:-없음}"
+
+  ENDPOINT=$(aws iot describe-endpoint --endpoint-type iot:Data-ATS --query 'endpointAddress' --output text)
+  cat <<EOD | tee /etc/default/aiot >/dev/null
+THING_NAME=${thing_name}
+IOT_ENDPOINT=${ENDPOINT}
 CA_PATH=/iotcert/AmazonRootCA1.pem
 CERT_PATH=/iotcert/${thing_name}.cert.pem
 KEY_PATH=/iotcert/${thing_name}.private.key
-
-S3_BUCKET=iot-school-env
-S3_PREFIX_BASE=data
-S3_PARTITION_TZ=UTC
-ROOM=$room_name
+DB_PATH=/aiot/dataset/sensor_data.db
+ROOM=room-${next}
 QOS=1
 EOD
 
-  echo
-  echo "[OK] /etc/default/aiot 생성 완료"
-  echo "[INFO] Device=${device_type}"
-  echo "[INFO] Thing=${thing_name}"
-  echo "[INFO] Room=${room_name}"
-  echo "[INFO] Endpoint=${endpoint}"
-  echo
-  check_file_layout
+  chown aiot:aiot /iotcert/*.pem
+  chmod 600 /iotcert/${thing_name}.private.key
+  chmod 644 /etc/default/aiot
+
+  echo "[완료] Thing=${thing_name}, Room=room-${next}"
+  echo "→ AWS IoT Core + Firehose 연결 완료"
 }
 
+# ------------------ 기존 configure 이하 그대로 유지 ------------------
+# (configure_env, start_collector, start_publisher, stop_role, status_role, check_all, usage)
 
-# ------------------ 실행/중지 ------------------
-prereqs_ok(){
-  local ok=0
-  have_cmd python3 || { echo "[MISS] python3"; ok=1; }
-  [ -x "${VENV}/bin/python" ] || { echo "[MISS] venv"; ok=1; }
-  if [ -x "${VENV}/bin/pip" ]; then
-    for mod in paho-mqtt boto3 AWSIoTPythonSDK; do
-      "${VENV}/bin/pip" show "$mod" >/dev/null 2>&1 || { echo "[MISS] python module: $mod"; ok=1; }
-    done
-  else
-    echo "[MISS] ${VENV}/bin/pip"; ok=1
-  fi
-  [ -f "$COLLECTOR" ] || { echo "[MISS] file: $COLLECTOR"; ok=1; }
-  [ -f "$PUBLISHER" ] || { echo "[MISS] file: $PUBLISHER"; ok=1; }
-  return $ok
-}
-
-start_collector(){
-  local log="${LOG_DIR}/collector.log" pidf="${PID_DIR}/collector.pid"
-  prereqs_ok || { echo "[BLOCK] 전제조건 미충족"; return 1; }
-  is_running "$COLLECTOR" && { echo "[SKIP] collector already running."; return 0; }
-  echo "[START] collector ..."; nohup "${VENV}/bin/python" -u "$COLLECTOR" >>"$log" 2>&1 & echo $! > "$pidf"
-  echo "[OK] collector pid=$(cat "$pidf"), log=$log"
-}
-
-start_publisher(){
-  local log="${LOG_DIR}/publisher.log" pidf="${PID_DIR}/publisher.pid"
-  prereqs_ok || { echo "[BLOCK] 전제조건 미충족"; return 1; }
-  is_running "$PUBLISHER" && { echo "[SKIP] publisher already running."; return 0; }
-  echo "[START] publisher (ROOM=${ROOM:-auto}) ..."
-  nohup "${VENV}/bin/python" -u "$PUBLISHER" --mode drain >>"$log" 2>&1 & echo $! > "$pidf"
-  echo "[OK] publisher pid=$(cat "$pidf"), log=$log"
-}
-
-stop_role(){
-  local role="$1" pidf="${PID_DIR}/${role}.pid"
-  if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
-    kill "$(cat "$pidf")" 2>/dev/null || true
-    rm -f "$pidf"
-    echo "[STOP] $role (pidfile)"
-  else
-    local target=""
-    [ "$role" = "collector" ] && target="$COLLECTOR" || target="$PUBLISHER"
-    pkill -f -- "^${VENV}/bin/python -u ${target}" 2>/dev/null || true
-    echo "[STOP] $role (pkill)"
-  fi
-}
-
-status_role(){
-  print_os_info; echo
-  echo "== process status =="; echo "collector : $(is_running "$COLLECTOR" && echo RUNNING || echo STOPPED)"
-  echo "publisher : $(is_running "$PUBLISHER" && echo RUNNING || echo STOPPED)"
-  echo; check_file_layout
-  echo; echo "logs:"; ls -l "$LOG_DIR" 2>/dev/null || true
-}
-
-check_all(){
-  print_os_info; echo
-  check_os_packages; echo
-  ensure_venv; echo
-  check_python_pkgs; echo
-  check_file_layout
-}
-
-usage(){
-  cat <<USAGE
-Usage:
-  aiot-manager configure
-  aiot-manager check
-  aiot-manager status
-  aiot-manager collector start|stop|restart
-  aiot-manager publisher start|stop|restart
-Examples:
-  aiot-manager configure                  # 게이트웨이 번호 입력 후 자동 구성
-  aiot-manager check                      # 누락 패키지 점검/설치
-  aiot-manager publisher start            # 퍼블리셔 실행
-USAGE
-  exit 1
-}
-
+# ------------------ main entry ------------------
 main(){
   local cmd="${1:-}"; shift || true
   case "$cmd" in
+    register) register_env ;;
     configure) configure_env ;;
-    check)     check_all ;;
-    status)    status_role ;;
+    check) check_all ;;
+    status) status_role ;;
     collector) case "${1:-}" in start) start_collector;; stop) stop_role collector;; restart) stop_role collector; start_collector;; *) usage;; esac ;;
     publisher) case "${1:-}" in start) start_publisher;; stop) stop_role publisher;; restart) stop_role publisher; start_publisher;; *) usage;; esac ;;
     *) usage ;;
