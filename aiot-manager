@@ -5,6 +5,8 @@
 # ============================================================
 set -euo pipefail
 
+aws configure set cli_pager "" >/dev/null 2>&1 || true
+
 APP_DIR="/opt/aiot"
 VENV="${APP_DIR}/venv"
 COLLECTOR="${APP_DIR}/mqtt_to_sqlite.py"
