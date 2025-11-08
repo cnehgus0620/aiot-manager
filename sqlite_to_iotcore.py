@@ -175,31 +175,84 @@ def publish_window(client, start_utc, end_utc, conn_ckpt):
     return len(rows)
 
 # ===== 실행 루프 =====
+
 def run_incremental(run_forever):
     client = connect_mqtt()
     try:
+        # === 로컬 체크포인트 커넥션을 루프 전부터 유지 ===
         with sqlite3.connect(DB_PATH) as conn_ckpt:
+            conn_ckpt.execute("PRAGMA journal_mode=WAL")
+            conn_ckpt.execute("PRAGMA busy_timeout=3000")
             ensure_checkpoint_table(conn_ckpt)
-            local_ckpt = get_local_checkpoint(conn_ckpt)
-        if local_ckpt:
-            last_utc_end = local_ckpt
-            log(f"[BOOT] Local checkpoint found: {epoch_to_utc_text(last_utc_end)} UTC")
-        else:
-            last_utc_end = get_latest_s3_window_utc(S3_BUCKET, S3_PREFIX_BASE)
-            log(f"[BOOT] S3 anchor fallback: {epoch_to_utc_text(last_utc_end)} UTC")
 
-        while True:
-            now = int(time.time())
-            target_end = floor_to_five_minutes_utc(now)
-            next_end = last_utc_end + 300
-            if next_end > target_end:
-                log(f"[IDLE] Up-to-date. last_end={epoch_to_utc_text(last_utc_end)} UTC (sleep 5s)")
-                if not run_forever: break
-                time.sleep(5)
-                continue
-            start_utc = next_end - 300
-            publish_window(client, start_utc, next_end, conn_ckpt)
-            last_utc_end = next_end
+            local_ckpt = get_local_checkpoint(conn_ckpt)
+            if local_ckpt:
+                last_utc_end = local_ckpt
+                log(f"[BOOT] Local checkpoint found: {epoch_to_utc_text(last_utc_end)} UTC")
+            else:
+                last_utc_end = get_latest_s3_window_utc(S3_BUCKET, S3_PREFIX_BASE)
+                log(f"[BOOT] S3 anchor fallback: {epoch_to_utc_text(last_utc_end)} UTC")
+
+            # === 메인 루프 ===
+            while True:
+                now = int(time.time())
+                target_end = floor_to_five_minutes_utc(now)
+                next_end = last_utc_end + 300
+
+                if next_end > target_end:
+                    log(f"[IDLE] Up-to-date. last_end={epoch_to_utc_text(last_utc_end)} UTC (sleep 5s)")
+                    if not run_forever: break
+                    time.sleep(5)
+                    continue
+
+                start_utc = next_end - 300
+                # === 읽기 전용 커넥션 (락 최소화) ===
+                with sqlite3.connect(DB_PATH) as conn_read:
+                    conn_read.execute("PRAGMA journal_mode=WAL")
+                    conn_read.execute("PRAGMA busy_timeout=3000")
+                    rows = fetch_utc_window_aggregate(conn_read, start_utc, next_end)
+
+                if not rows:
+                    log(f"[INFO] No data in window (UTC {epoch_to_utc_text(start_utc)}~{epoch_to_utc_text(next_end)}). Skipped.")
+                    update_local_checkpoint(conn_ckpt, next_end)
+                    last_utc_end = next_end
+                    continue
+
+                # === 집계 및 MQTT 발행 ===
+                for r in rows:
+                    r["temp_std"] = calc_std(r["temp_avg"], r["t_sumsq"], r["n"])
+                    r["hum_std"]  = calc_std(r["hum_avg"],  r["h_sumsq"], r["n"])
+                    r["gas_std"]  = calc_std(r["gas_avg"],  r["g_sumsq"], r["n"])
+                    r["pm_std"]   = calc_std(r["pm_avg"],   r["pm_sumsq"], r["n"])
+
+                    kst_dt = datetime.datetime.fromtimestamp(start_utc, tz=UTC).astimezone(KST)
+                    year, month, day, hour = kst_dt.strftime("%Y"), kst_dt.strftime("%m"), kst_dt.strftime("%d"), kst_dt.strftime("%H")
+                    min5 = f"{(kst_dt.minute // 5) * 5:02d}"
+                    room_digits = re.search(r"(\d+)$", ROOM)
+                    room_p = room_digits.group(1) if room_digits else "unknown"
+
+                    payload = {
+                        "device": r["dev"], "room": ROOM,
+                        "window_start": epoch_to_utc_text(start_utc),
+                        "window_end": epoch_to_utc_text(next_end),
+                        "window_start_kst": epoch_to_kst_text(start_utc),
+                        "window_end_kst": epoch_to_kst_text(next_end),
+                        "count": r["n"],
+                        "temp_avg": r["temp_avg"], "temp_max": r["temp_max"], "temp_min": r["temp_min"], "temp_std": r["temp_std"],
+                        "hum_avg": r["hum_avg"], "hum_max": r["hum_max"], "hum_min": r["hum_min"], "hum_std": r["hum_std"],
+                        "lux_avg": r["lux_avg"],
+                        "gas_avg": r["gas_avg"], "gas_max": r["gas_max"], "gas_min": r["gas_min"], "gas_std": r["gas_std"],
+                        "pm_avg": r["pm_avg"], "pm_max": r["pm_max"], "pm_min": r["pm_min"], "pm_std": r["pm_std"],
+                        "year": year, "month": month, "day": day, "hour": hour, "min5": min5, "room_p": room_p
+                    }
+
+                    msg = json.dumps(payload, ensure_ascii=False)
+                    client.publish(TOPIC, msg, QOS)
+                    log(f"[PUBLISH] {r['dev']} ({year}-{month}-{day} {hour}:{min5}) -> {TOPIC}")
+
+                update_local_checkpoint(conn_ckpt, next_end)
+                last_utc_end = next_end
+
     finally:
         try:
             client.disconnect()
