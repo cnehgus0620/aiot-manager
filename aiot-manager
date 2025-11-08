@@ -260,8 +260,16 @@ start_publisher(){
 
 stop_role(){
   local role="$1" pidf="${PID_DIR}/${role}.pid"
-  [ -f "$pidf" ] && kill "$(cat "$pidf")" 2>/dev/null || pkill -f "$role" || true
-  rm -f "$pidf"; echo "[STOP] $role"
+  if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
+    kill "$(cat "$pidf")" 2>/dev/null || true
+    rm -f "$pidf"
+    echo "[STOP] $role (pidfile)"
+  else
+    local target=""
+    [ "$role" = "collector" ] && target="$COLLECTOR" || target="$PUBLISHER"
+    pkill -f -- "^${VENV}/bin/python -u ${target}" 2>/dev/null || true
+    echo "[STOP] $role (pkill)"
+  fi
 }
 
 status_role(){
