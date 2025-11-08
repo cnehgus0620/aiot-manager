@@ -173,8 +173,7 @@ register_env(){
   aws iot attach-thing-principal --thing-name "$thing_name" --principal "$CERT_ARN"
   echo "[OK] 정책 및 연결 완료 (${POLICY})"
 
-  REGION=$(aws configure get region)
-  REGION=${REGION:-ap-northeast-2}
+  REGION="ap-northeast-2"
 
   FIREHOSE_NAME=$(aws firehose list-delivery-streams --region "$REGION" --query 'DeliveryStreamNames[0]' --output text 2>/dev/null)
 
