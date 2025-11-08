@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# AIoT collector/publisher 통합 관리 스크립트
+# 기능: configure / check / status / collector / publisher
+set -euo pipefail
+
+APP_DIR="/opt/aiot"
+VENV="${APP_DIR}/venv"
+COLLECTOR="${APP_DIR}/mqtt_to_sqlite.py"
+PUBLISHER="${APP_DIR}/sqlite_to_iotcore.py"
+LOG_DIR="/var/log/aiot"
+PID_DIR="/run/aiot"
+SUDO=${SUDO:-sudo}
+
+# 공용 ENV 로드(있으면)
+[ -f /etc/default/aiot ] && set -a && . /etc/default/aiot && set +a
+mkdir -p "$LOG_DIR" "$PID_DIR"
+
+# ------------------ 공용 유틸 ------------------
+have_cmd(){ command -v "$1" >/dev/null 2>&1; }
+is_running(){ pgrep -f -- "$1" >/dev/null 2>&1; }
+
+print_os_info(){
+  echo "== system =="
+  if [ -f /etc/os-release ]; then . /etc/os-release; echo "OS        : ${PRETTY_NAME:-Unknown}"; else echo "OS        : Unknown"; fi
+  echo "Kernel    : $(uname -r)"
+  echo "Arch      : $(uname -m)"
+  echo "Hostname  : $(hostname)"
+}
+
+prompt_int(){
+  local msg="$1" var
+  while :; do
+    read -r -p "$msg" var
+    [[ "$var" =~ ^[0-9]+$ ]] && { echo "$var"; return 0; }
+    echo "숫자만 입력하세요."
+  done
+}
+
+# ------------------ OS 패키지 ------------------
+detect_pkg_mgr(){
+  if have_cmd apt-get; then echo "apt"
+  elif have_cmd dnf; then echo "dnf"
+  elif have_cmd yum; then echo "yum"
+  elif have_cmd pacman; then echo "pacman"
+  elif have_cmd zypper; then echo "zypper"
+  else echo "unknown"; fi
+}
+
+required_os_packages(){
+  case "$1" in
+    apt) echo "python3 python3-venv python3-pip mosquitto mosquitto-clients jq ca-certificates awscli" ;;
+    dnf|yum) echo "python3 python3-virtualenv python3-pip mosquitto mosquitto-clients jq ca-certificates awscli" ;;
+    pacman) echo "python python-pip python-virtualenv mosquitto jq ca-certificates aws-cli" ;;
+    zypper) echo "python3 python3-pip python3-virtualenv mosquitto jq ca-certificates aws-cli" ;;
+    *) echo "" ;;
+  esac
+}
+
+pkg_installed(){
+  local mgr="$1" pkg="$2"
+  case "$mgr" in
+    apt) dpkg -s "$pkg" >/dev/null 2>&1 ;;
+    dnf|yum|zypper) rpm -q "$pkg" >/dev/null 2>&1 ;;
+    pacman) pacman -Q "$pkg" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+install_packages(){
+  local mgr="$1"; shift
+  local pkgs=("$@")
+  case "$mgr" in
+    apt) $SUDO apt-get update && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" ;;
+    dnf) $SUDO dnf install -y "${pkgs[@]}" ;;
+    yum) $SUDO yum install -y "${pkgs[@]}" ;;
+    pacman) $SUDO pacman -Sy --noconfirm "${pkgs[@]}" ;;
+    zypper) $SUDO zypper --non-interactive install "${pkgs[@]}" ;;
+  esac
+}
+
+check_os_packages(){
+  local mgr list missing=()
+  mgr="$(detect_pkg_mgr)"
+  list="$(required_os_packages "$mgr")"
+  [ -z "$list" ] && { echo "[WARN] 패키지 관리자 인식 실패"; return 0; }
+
+  for p in $list; do pkg_installed "$mgr" "$p" || missing+=("$p"); done
+
+  if (( ${#missing[@]} )); then
+    echo "== missing OS packages =="; printf ' - %s\n' "${missing[@]}"
+    read -r -p "설치하시겠습니까? [Y/n] " ans; ans=${ans:-Y}
+    [[ "$ans" =~ ^[Yy]$ ]] && install_packages "$mgr" "${missing[@]}"
+  else
+    echo "== OS packages =="; echo "모든 필수 패키지 설치됨."
+  fi
+}
+
+# ------------------ Python / venv ------------------
+ensure_venv(){
+  echo "== python venv =="
+  if [ -x "${VENV}/bin/python" ]; then echo "존재: ${VENV}"; return; fi
+  read -r -p "가상환경이 없습니다. 생성하시겠습니까? [Y/n] " ans; ans=${ans:-Y}
+  [[ "$ans" =~ ^[Yy]$ ]] || return
+  $SUDO -u "$(stat -c %U "$APP_DIR")" python3 -m venv "$VENV"
+  $SUDO -u "$(stat -c %U "$APP_DIR")" "${VENV}/bin/pip" install --upgrade pip
+}
+
+check_python_pkgs(){
+  local missing=()
+  for m in paho-mqtt boto3 AWSIoTPythonSDK; do
+    "${VENV}/bin/pip" show "$m" >/dev/null 2>&1 || missing+=("$m")
+  done
+  if (( ${#missing[@]} )); then
+    echo "== missing python packages =="; printf ' - %s\n' "${missing[@]}"
+    read -r -p "venv에 설치하시겠습니까? [Y/n] " ans; ans=${ans:-Y}
+    [[ "$ans" =~ ^[Yy]$ ]] && "${VENV}/bin/pip" install "${missing[@]}"
+  else
+    echo "== python packages =="; echo "모든 필수 모듈 설치됨."
+  fi
+}
+
+# ------------------ 파일 구조 ------------------
+check_file_layout(){
+  echo "== file layout =="
+  printf " - %s : %s\n" "$COLLECTOR"  "$( [ -f "$COLLECTOR" ]  && echo OK || echo MISSING )"
+  printf " - %s : %s\n" "$PUBLISHER"  "$( [ -f "$PUBLISHER" ]  && echo OK || echo MISSING )"
+  printf " - /etc/aiot/endpoint : %s\n" "$( [ -f /etc/aiot/endpoint ] && echo OK || echo MISSING )"
+  printf " - /etc/aiot/room     : %s\n" "$( [ -f /etc/aiot/room ]     && echo OK || echo MISSING )"
+  printf " - /iotcert/*.pem     : %s\n" "$( ls /iotcert/*.pem >/dev/null 2>&1 && echo OK || echo 'MISSING (복사 필요)' )"
+}
+
+# ------------------ configure ------------------
+configure_env(){
+  echo "=== AIoT 환경 설정 마법사 (디바이스 유형 + room 자동 접두어 버전) ==="
+  $SUDO mkdir -p /etc/aiot
+  local endpoint_file="/etc/aiot/endpoint"
+  local room_file="/etc/aiot/room"
+  local default_env="/etc/default/aiot"
+
+  stty sane  # ← 터미널 입력 복원
+
+  # 0️⃣  AWS 로그인 여부 확인
+  echo "[0/4] AWS CLI 인증 상태 확인 중..."
+  if ! aws sts get-caller-identity >/dev/null 2>&1; then
+    echo "[ERROR] AWS CLI가 인증되지 않았습니다."
+    echo "다음 명령으로 로그인해 주세요:"
+    echo "  aws configure"
+    echo
+    echo "설정 후 다시 'aiot-manager configure'를 실행하세요."
+    exit 1
+  else
+    local aws_user aws_account
+    aws_user="$(aws sts get-caller-identity --query 'Arn' --output text 2>/dev/null)"
+    aws_account="$(aws sts get-caller-identity --query 'Account' --output text 2>/dev/null)"
+    echo "[OK] AWS 인증 확인됨 (Account: ${aws_account}, User: ${aws_user})"
+  fi
+
+  # 1️⃣  디바이스 유형 선택
+  echo "[1/4] 디바이스 유형 선택"
+  echo "1) Raspberry Pi"
+  echo "2) Jetson Nano"
+  read -r -p "선택 (1 또는 2): " dev_sel
+  case "$dev_sel" in
+    1) device_type="RaspberryPi5" ;;
+    2) device_type="JetsonNano" ;;
+    *) echo "[WARN] 잘못된 입력 → 기본값 RaspberryPi5 사용"; device_type="RaspberryPi5" ;;
+  esac
+
+  # 2️⃣  게이트웨이 번호 입력
+  local gw_num
+  gw_num="$(prompt_int '[2/4] 게이트웨이(Thing) 번호 입력 (정수) = ')"
+
+  # 3️⃣  방 번호 입력 (room- 접두어 자동)
+  local room_num
+  room_num="$(prompt_int '[3/4] 방 번호 입력 (정수) = ')"
+  local room_name="room-${room_num}"
+  echo "$room_name" | $SUDO tee "$room_file" >/dev/null
+
+  # 4️⃣  AWS IoT 엔드포인트 자동 감지
+  echo "[4/4] AWS IoT Core 엔드포인트 자동 탐색 중..."
+  local endpoint
+  endpoint="$(aws iot describe-endpoint --endpoint-type iot:Data-ATS --query 'endpointAddress' --output text 2>/dev/null || true)"
+
+  if [ -z "$endpoint" ]; then
+    echo "[WARN] awscli에서 엔드포인트를 가져오지 못했습니다."
+    echo "직접 입력하시겠습니까? (엔드포인트 시리얼만, 예: a9jkapbuh4ma7)"
+    read -r serial
+    endpoint="${serial}-ats.iot.ap-northeast-2.amazonaws.com"
+  fi
+  echo "$endpoint" | $SUDO tee "$endpoint_file" >/dev/null
+
+  # THING 이름 자동 생성
+  local thing_name="${device_type}_IoT_Thing_Gateway_${gw_num}"
+
+  # 환경 파일 생성
+  $SUDO tee "$default_env" >/dev/null <<EOD
+# ===== AIoT 공용 환경 =====
+DB_PATH=/aiot/dataset/sensor_data.db
+MQTT_HOST=127.0.0.1
+MQTT_PORT=1883
+TOPIC=sensor/metrics
+
+THING_NAME=$thing_name
+IOT_ENDPOINT=$endpoint
+CA_PATH=/iotcert/AmazonRootCA1.pem
+CERT_PATH=/iotcert/${thing_name}.cert.pem
+KEY_PATH=/iotcert/${thing_name}.private.key
+
+S3_BUCKET=iot-school-env
+S3_PREFIX_BASE=data
+S3_PARTITION_TZ=UTC
+ROOM=$room_name
+QOS=1
+EOD
+
+  echo
+  echo "[OK] /etc/default/aiot 생성 완료"
+  echo "[INFO] Device=${device_type}"
+  echo "[INFO] Thing=${thing_name}"
+  echo "[INFO] Room=${room_name}"
+  echo "[INFO] Endpoint=${endpoint}"
+  echo
+  check_file_layout
+}
+
+
+# ------------------ 실행/중지 ------------------
+prereqs_ok(){
+  local ok=0
+  have_cmd python3 || { echo "[MISS] python3"; ok=1; }
+  [ -x "${VENV}/bin/python" ] || { echo "[MISS] venv"; ok=1; }
+  if [ -x "${VENV}/bin/pip" ]; then
+    for mod in paho-mqtt boto3 AWSIoTPythonSDK; do
+      "${VENV}/bin/pip" show "$mod" >/dev/null 2>&1 || { echo "[MISS] python module: $mod"; ok=1; }
+    done
+  else
+    echo "[MISS] ${VENV}/bin/pip"; ok=1
+  fi
+  [ -f "$COLLECTOR" ] || { echo "[MISS] file: $COLLECTOR"; ok=1; }
+  [ -f "$PUBLISHER" ] || { echo "[MISS] file: $PUBLISHER"; ok=1; }
+  return $ok
+}
+
+start_collector(){
+  local log="${LOG_DIR}/collector.log" pidf="${PID_DIR}/collector.pid"
+  prereqs_ok || { echo "[BLOCK] 전제조건 미충족"; return 1; }
+  is_running "$COLLECTOR" && { echo "[SKIP] collector already running."; return 0; }
+  echo "[START] collector ..."; nohup "${VENV}/bin/python" -u "$COLLECTOR" >>"$log" 2>&1 & echo $! > "$pidf"
+  echo "[OK] collector pid=$(cat "$pidf"), log=$log"
+}
+
+start_publisher(){
+  local log="${LOG_DIR}/publisher.log" pidf="${PID_DIR}/publisher.pid"
+  prereqs_ok || { echo "[BLOCK] 전제조건 미충족"; return 1; }
+  is_running "$PUBLISHER" && { echo "[SKIP] publisher already running."; return 0; }
+  echo "[START] publisher (ROOM=${ROOM:-auto}) ..."
+  nohup "${VENV}/bin/python" -u "$PUBLISHER" --mode drain >>"$log" 2>&1 & echo $! > "$pidf"
+  echo "[OK] publisher pid=$(cat "$pidf"), log=$log"
+}
+
+stop_role(){
+  local role="$1" pidf="${PID_DIR}/${role}.pid"
+  [ -f "$pidf" ] && kill "$(cat "$pidf")" 2>/dev/null || pkill -f "$role" || true
+  rm -f "$pidf"; echo "[STOP] $role"
+}
+
+status_role(){
+  print_os_info; echo
+  echo "== process status =="; echo "collector : $(is_running "$COLLECTOR" && echo RUNNING || echo STOPPED)"
+  echo "publisher : $(is_running "$PUBLISHER" && echo RUNNING || echo STOPPED)"
+  echo; check_file_layout
+  echo; echo "logs:"; ls -l "$LOG_DIR" 2>/dev/null || true
+}
+
+check_all(){
+  print_os_info; echo
+  check_os_packages; echo
+  ensure_venv; echo
+  check_python_pkgs; echo
+  check_file_layout
+}
+
+usage(){
+  cat <<USAGE
+Usage:
+  aiot-manager configure
+  aiot-manager check
+  aiot-manager status
+  aiot-manager collector start|stop|restart
+  aiot-manager publisher start|stop|restart
+Examples:
+  aiot-manager configure                  # 게이트웨이 번호 입력 후 자동 구성
+  aiot-manager check                      # 누락 패키지 점검/설치
+  aiot-manager publisher start            # 퍼블리셔 실행
+USAGE
+  exit 1
+}
+
+main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    configure) configure_env ;;
+    check)     check_all ;;
+    status)    status_role ;;
+    collector) case "${1:-}" in start) start_collector;; stop) stop_role collector;; restart) stop_role collector; start_collector;; *) usage;; esac ;;
+    publisher) case "${1:-}" in start) start_publisher;; stop) stop_role publisher;; restart) stop_role publisher; start_publisher;; *) usage;; esac ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"
