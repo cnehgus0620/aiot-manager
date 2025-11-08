@@ -175,10 +175,11 @@ register_env(){
   echo "[OK] 정책 및 연결 완료 (${POLICY_NAME})"
 
   echo "[3/6] Firehose 스트림 확인 중..."
-  FIREHOSE_NAME=$(aws firehose list-delivery-streams \
+  FIREHOSE_NAME=$(sudo -E -u "$SUDO_USER" aws firehose list-delivery-streams \
     --region ap-northeast-2 \
     --query 'DeliveryStreamNames[0]' \
-    --output text 2>/dev/null | tr -d '\r')
+    --output text 2>/dev/null | tr -d '\r' || true)
+
 
   if [ -z "$FIREHOSE_NAME" ] || [ "$FIREHOSE_NAME" = "None" ] || [ "$FIREHOSE_NAME" = "null" ]; then
     echo "[WARN] Firehose 스트림이 없습니다. 콘솔에서 미리 생성하세요. (예: PUT-S3-ieDa3)"
