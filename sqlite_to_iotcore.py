@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SQLite → AWS IoT Core 퍼블리셔 (S3 객체 기반 최신 동기화)
+SQLite → AWS IoT Core 퍼블리셔 (로컬 체크포인트 + 안정적 room 파티션)
 - Glue 평면 컬럼 스키마 호환 (year, month, day, hour, min5, room_p)
 - temp/hum/gas/pm 표준편차(std) 포함
 - SQLite는 "YYYY-MM-DD HH:MM:SS" (KST 문자열)
-- S3 최신 파티션(UTC/KST) 비교 후 자동 진행
+- S3는 예외 복구 시에만 참조
 """
 
 import os, sys, time, json, sqlite3, datetime, boto3, re
@@ -23,7 +23,7 @@ TOPIC          = os.getenv("TOPIC", "iot/sensor/minute")
 S3_BUCKET      = os.getenv("S3_BUCKET", "iot-school-env")
 S3_PREFIX_BASE = os.getenv("S3_PREFIX_BASE", "data")
 S3_PARTITION_TZ= os.getenv("S3_PARTITION_TZ", "UTC").upper()
-ROOM           = os.getenv("ROOM", "lecture-306")
+ROOM           = os.getenv("ROOM", "room-306")
 QOS            = int(os.getenv("QOS", "1"))
 
 KST = ZoneInfo("Asia/Seoul")
@@ -48,37 +48,49 @@ def calc_std(avg, sumsq, n):
     if var < 0: var = 0
     return round(var ** 0.5, 4)
 
-# ===== S3 최신 파티션 탐색 =====
+# ===== 로컬 체크포인트 =====
+def ensure_checkpoint_table(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS iot_checkpoint (last_end_utc INTEGER)")
+    conn.commit()
+
+def get_local_checkpoint(conn):
+    row = conn.execute("SELECT last_end_utc FROM iot_checkpoint ORDER BY ROWID DESC LIMIT 1").fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+def update_local_checkpoint(conn, value):
+    conn.execute("DELETE FROM iot_checkpoint")
+    conn.execute("INSERT INTO iot_checkpoint (last_end_utc) VALUES (?)", (int(value),))
+    conn.commit()
+
+# ===== S3 최신 파티션 (예외 복구용) =====
 def s3_part_to_end_utc(y, mo, d, h, m5):
     base_tz = UTC if S3_PARTITION_TZ == "UTC" else KST
     dt = datetime.datetime(y, mo, d, h, m5, tzinfo=base_tz) + datetime.timedelta(minutes=5)
     return int(dt.astimezone(UTC).timestamp())
 
 def get_latest_s3_window_utc(bucket, prefix_base):
-    prefixes = []
     try:
         paginator = s3.get_paginator("list_objects_v2")
+        latest = 0
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix_base):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                if not (key.endswith(".json") or key.endswith(".parquet") or key.endswith(".gz") or key.endswith(".gzip")):
+                if not any(key.endswith(ext) for ext in [".json", ".parquet", ".gz", ".gzip"]):
                     continue
                 parts = [p.split("=")[-1] for p in key.split("/") if "=" in p]
                 if len(parts) >= 5:
                     try:
                         y, mo, d, h, m5 = map(int, parts[:5])
-                        prefixes.append(s3_part_to_end_utc(y, mo, d, h, m5))
+                        end_utc = s3_part_to_end_utc(y, mo, d, h, m5)
+                        latest = max(latest, end_utc)
                     except Exception:
                         continue
-        if prefixes:
-            latest = max(prefixes)
+        if latest:
             log(f"[S3] Latest object partition end: {epoch_to_utc_text(latest)} UTC")
             return latest
-        else:
-            log("[S3] No data objects found (only folders?).")
     except Exception as e:
         log(f"[WARN] S3 list failed: {e}")
-    return int(time.time()) - 300
+    return 0
 
 # ===== MQTT 연결 =====
 def connect_mqtt():
@@ -115,13 +127,8 @@ def fetch_utc_window_aggregate(conn, start_utc, end_utc):
     cur = conn.execute(sql, (start_kst, end_kst))
     return [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
 
-# ===== room_p 추출 =====
-def extract_room_p(dev_name):
-    m = re.search(r"(\d+)$", dev_name or "")
-    return m.group(1) if m else "unknown"
-
 # ===== 발행 =====
-def publish_window(client, start_utc, end_utc):
+def publish_window(client, start_utc, end_utc, conn_ckpt):
     start_s, end_s = epoch_to_utc_text(start_utc), epoch_to_utc_text(end_utc)
     log(f"[WINDOW][UTC] {start_s} ~ {end_s} : aggregating ...")
     with sqlite3.connect(DB_PATH) as conn:
@@ -130,18 +137,19 @@ def publish_window(client, start_utc, end_utc):
         log(f"[INFO] No data in window (UTC {start_s}~{end_s}). Skipped.")
         return 0
 
+    # ROOM에서 숫자만 추출
+    room_digits = re.search(r"(\d+)$", ROOM)
+    room_p = room_digits.group(1) if room_digits else "unknown"
+
     for r in rows:
-        # 표준편차 계산
         r["temp_std"] = calc_std(r["temp_avg"], r["t_sumsq"], r["n"])
         r["hum_std"]  = calc_std(r["hum_avg"],  r["h_sumsq"], r["n"])
         r["gas_std"]  = calc_std(r["gas_avg"],  r["g_sumsq"], r["n"])
         r["pm_std"]   = calc_std(r["pm_avg"],   r["pm_sumsq"], r["n"])
 
-        # Glue 파티션용 시간 필드
         kst_dt = datetime.datetime.fromtimestamp(start_utc, tz=UTC).astimezone(KST)
         year, month, day, hour = kst_dt.strftime("%Y"), kst_dt.strftime("%m"), kst_dt.strftime("%d"), kst_dt.strftime("%H")
         min5 = f"{(kst_dt.minute // 5) * 5:02d}"
-        room_p = extract_room_p(r["dev"])
 
         payload = {
             "device": r["dev"], "room": ROOM,
@@ -162,25 +170,23 @@ def publish_window(client, start_utc, end_utc):
         client.publish(TOPIC, msg, QOS)
         log(f"[PUBLISH] {r['dev']} ({year}-{month}-{day} {hour}:{min5}) -> {TOPIC}")
 
+    # 윈도우 처리 완료 후 로컬 체크포인트 갱신
+    update_local_checkpoint(conn_ckpt, end_utc)
     return len(rows)
 
 # ===== 실행 루프 =====
 def run_incremental(run_forever):
     client = connect_mqtt()
     try:
-        last_utc_end = get_latest_s3_window_utc(S3_BUCKET, S3_PREFIX_BASE)
-        log(f"[BOOT] latest S3 end: {epoch_to_utc_text(last_utc_end)} UTC / {epoch_to_kst_text(last_utc_end)} KST")
-
-        with sqlite3.connect(DB_PATH) as conn:
-            row = conn.execute("SELECT MAX(strftime('%s', ts, '-9 hours')) FROM metrics").fetchone()
-            db_max_utc = int(row[0]) if row and row[0] is not None else 0
-
-        if db_max_utc:
-            log(f"[BOOT] DB  max end: {epoch_to_utc_text(db_max_utc)} UTC / {epoch_to_kst_text(db_max_utc)} KST")
-
-        if db_max_utc and last_utc_end - db_max_utc > 6 * 3600:
-            log("[WARN] S3 anchor >> DB by >6h. Rolling back to DB max.")
-            last_utc_end = db_max_utc
+        with sqlite3.connect(DB_PATH) as conn_ckpt:
+            ensure_checkpoint_table(conn_ckpt)
+            local_ckpt = get_local_checkpoint(conn_ckpt)
+        if local_ckpt:
+            last_utc_end = local_ckpt
+            log(f"[BOOT] Local checkpoint found: {epoch_to_utc_text(last_utc_end)} UTC")
+        else:
+            last_utc_end = get_latest_s3_window_utc(S3_BUCKET, S3_PREFIX_BASE)
+            log(f"[BOOT] S3 anchor fallback: {epoch_to_utc_text(last_utc_end)} UTC")
 
         while True:
             now = int(time.time())
@@ -192,7 +198,7 @@ def run_incremental(run_forever):
                 time.sleep(5)
                 continue
             start_utc = next_end - 300
-            publish_window(client, start_utc, next_end)
+            publish_window(client, start_utc, next_end, conn_ckpt)
             last_utc_end = next_end
     finally:
         try:
@@ -205,6 +211,6 @@ def run_incremental(run_forever):
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["once","drain"], default="drain")
+    ap.add_argument("--mode", choices=["once", "drain"], default="drain")
     args = ap.parse_args()
     run_incremental(run_forever=(args.mode == "drain"))
