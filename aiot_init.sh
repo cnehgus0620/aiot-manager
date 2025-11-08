@@ -34,8 +34,8 @@ fi
 
 # 2️⃣ 필수 디렉토리 준비
 echo "[1/6] Preparing directories..."
-sudo mkdir -p "$APP_DIR" /var/log/aiot /iotcert
-sudo chown -R aiot:aiot "$APP_DIR" /var/log/aiot /iotcert
+sudo mkdir -p "$APP_DIR" /var/log/aiot /iotcert /aiot/dataset /run/aiot
+sudo chown -R aiot:aiot "$APP_DIR" /aiot /var/log/aiot /iotcert /run/aiot
 echo "[OK] 디렉토리 구조 준비 완료"
 
 # 3️⃣ aiot-manager 다운로드 및 배치
