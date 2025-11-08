@@ -168,7 +168,7 @@ register_env(){
 
   [ -f /iotcert/AmazonRootCA1.pem ] || wget -q https://www.amazontrust.com/repository/AmazonRootCA1.pem -O /iotcert/AmazonRootCA1.pem
 
-  POLICY="MyIoTPolicy"
+  POLICY="IoTRuleRole-FirehoseToS3"
   if ! aws iot list-policies --query "policies[?policyName=='${POLICY}']" --output text | grep -q "$POLICY"; then
     echo "[WARN] Policy ${POLICY} 미존재 → 자동 생성"
     aws iot create-policy --policy-name "$POLICY" \
