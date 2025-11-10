@@ -232,6 +232,77 @@ USAGE
   exit 1
 }
 
+# ------------------ register / configure ------------------
+
+register_env(){
+  echo "=== AIoT Gateway Auto Register (Thing + Certificate + Firehose + IoT Rule) ==="
+  read -r -p "디바이스 유형을 선택하세요 (1) Raspberry Pi (2) Jetson Nano: " choice
+  case "$choice" in
+    1) DEVICE_TYPE="RaspberryPi" ;;
+    2) DEVICE_TYPE="JetsonNano" ;;
+    *) echo "[ERR] 잘못된 선택입니다."; return 1 ;;
+  esac
+
+  THING_NAME="${DEVICE_TYPE}_IoT_Thing_Gateway_1"
+  REGION="${AWS_REGION:-ap-northeast-2}"
+
+  echo "[1/6] 기존 Thing 조회 중..."
+  if aws iot describe-thing --thing-name "$THING_NAME" --region "$REGION" >/dev/null 2>&1; then
+    echo "[OK] 기존 Thing 존재: $THING_NAME"
+  else
+    echo "[2/6] 새 Thing 생성 중..."
+    aws iot create-thing --thing-name "$THING_NAME" --region "$REGION" >/dev/null
+    echo "[OK] Thing 생성 완료"
+  fi
+
+  CERT_DIR="${APP_DIR}/certs"
+  mkdir -p "$CERT_DIR"
+
+  echo "[3/6] 인증서 발급 중..."
+  CERT_INFO=$(aws iot create-keys-and-certificate --set-as-active --region "$REGION")
+  echo "$CERT_INFO" | jq -r '.certificatePem' > "${CERT_DIR}/device.crt"
+  echo "$CERT_INFO" | jq -r '.keyPair.PrivateKey' > "${CERT_DIR}/private.key"
+  aws iot describe-ca-certificate --certificate-id "$(aws iot list-ca-certificates --region "$REGION" | jq -r '.certificates[0].certificateId')" --region "$REGION" | jq -r '.certificateDescription.certificatePem' > "${CERT_DIR}/rootCA.pem"
+  CERT_ARN=$(echo "$CERT_INFO" | jq -r '.certificateArn')
+  echo "[OK] 인증서 및 키 생성 완료"
+
+  POLICY_NAME="IoTRulePolicy-FirehoseToS3"
+  echo "[4/6] 정책 연결 중..."
+  if ! aws iot list-policies --region "$REGION" | grep -q "$POLICY_NAME"; then
+    echo "[WARN] 정책이 없습니다. 콘솔에서 미리 생성하세요. (예: $POLICY_NAME)"
+  else
+    aws iot attach-policy --policy-name "$POLICY_NAME" --target "$CERT_ARN" --region "$REGION"
+    echo "[OK] 정책 연결 완료"
+  fi
+
+  echo "[5/6] Thing과 인증서 연결 중..."
+  aws iot attach-thing-principal --thing-name "$THING_NAME" --principal "$CERT_ARN" --region "$REGION"
+
+  echo "[6/6] Firehose 스트림 연결 확인 중..."
+  STREAM=$(aws firehose list-delivery-streams --region "$REGION" --query 'DeliveryStreamNames[0]' --output text 2>/dev/null || echo "None")
+  echo "[INFO] 연결된 Firehose: ${STREAM:-None}"
+
+  echo "[완료] Thing=${THING_NAME}, Room=${ROOM:-room-1}"
+}
+
+configure_env(){
+  echo "=== AIoT Gateway 수동 구성 ==="
+  read -r -p "Thing Name 입력: " THING_NAME
+  read -r -p "AWS IoT Endpoint 입력 (예: a1b2c3d4e5f6-ats.iot.ap-northeast-2.amazonaws.com): " IOT_ENDPOINT
+  read -r -p "Firehose 스트림 이름 입력: " FIREHOSE
+  read -r -p "Room 이름 입력 (예: room-306): " ROOM
+
+  CONF_FILE="/etc/default/aiot"
+  $SUDO tee "$CONF_FILE" >/dev/null <<CONF
+THING_NAME="$THING_NAME"
+IOT_ENDPOINT="$IOT_ENDPOINT"
+FIREHOSE="$FIREHOSE"
+ROOM="$ROOM"
+CONF
+
+  echo "[OK] 설정이 저장되었습니다: $CONF_FILE"
+}
+
 main(){
   local cmd="${1:-}"; shift || true
   case "$cmd" in
