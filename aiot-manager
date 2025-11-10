@@ -291,7 +291,7 @@ register_env(){
     echo "[WARN] Firehose 스트림이 없습니다. 콘솔에서 미리 생성하세요. (예: PUT-S3-ieDa3)"
   else
     echo "[INFO] 연결된 Firehose: ${FIREHOSE_NAME}"
-    RULE_NAME="IoTRuleToFirehose"
+    RULE_NAME="rule_to_firehose"
     if ! aws iot get-topic-rule --rule-name "$RULE_NAME" --region ap-northeast-2 >/dev/null 2>&1; then
       echo "[INFO] IoT 규칙 ${RULE_NAME} 미존재 → 자동 생성 중..."
       ROLE_ARN=$(aws iam get-role --role-name "IoTRuleRole-FirehoseToS3" --query 'Role.Arn' --output text --region ap-northeast-2 2>/dev/null || echo "")
@@ -299,7 +299,7 @@ register_env(){
         aws iot create-topic-rule --region ap-northeast-2 \
           --rule-name "$RULE_NAME" \
           --topic-rule-payload "{
-            \"sql\": \"SELECT * FROM 'sensor/metrics'\",
+            \"sql\": \"SELECT * FROM 'iot/sensor/minute'\",
             \"actions\": [{
               \"firehose\": {
                 \"roleArn\": \"${ROLE_ARN}\",
