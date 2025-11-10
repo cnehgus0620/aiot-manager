@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="https://raw.githubusercontent.com/cnehgus0620/aiot-manager/main"
+REPO_URL="https://raw.githubusercontent.com/cnehgus0620/aiot-manager/main/"
 APP_DIR="/opt/aiot"
 BIN_PATH="/usr/local/bin/aiot-manager"
 
@@ -40,14 +40,14 @@ echo "[OK] 디렉토리 구조 준비 완료"
 
 # 3️⃣ aiot-manager 다운로드 및 배치
 echo "[2/6] Downloading aiot-manager..."
-sudo curl -fsSL -o "$BIN_PATH" "$REPO_URL/aiot-manager"
+sudo curl -fsSL -o "$BIN_PATH" "${REPO_URL}aiot-manager"
 sudo chmod +x "$BIN_PATH"
 echo "[OK] /usr/local/bin/aiot-manager 등록 완료"
 
 # 4️⃣ Collector / Publisher 코드 다운로드
 echo "[3/6] Downloading collector & publisher scripts..."
-sudo curl -fsSL -o "$APP_DIR/mqtt_to_sqlite.py" "$REPO_URL/mqtt_to_sqlite.py"
-sudo curl -fsSL -o "$APP_DIR/sqlite_to_iotcore.py" "$REPO_URL/sqlite_to_iotcore.py"
+sudo curl -fsSL -o "$APP_DIR/mqtt_to_sqlite.py" "${REPO_URL}mqtt_to_sqlite.py"
+sudo curl -fsSL -o "$APP_DIR/sqlite_to_iotcore.py" "${REPO_URL}sqlite_to_iotcore.py"
 sudo chown aiot:aiot "$APP_DIR"/*.py
 echo "[OK] /opt/aiot 코드 배치 완료"
 
