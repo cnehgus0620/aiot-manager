@@ -40,7 +40,7 @@ echo "[OK] 디렉토리 구조 준비 완료"
 
 # 3️⃣ aiot-manager 다운로드 및 배치
 echo "[2/6] Downloading aiot-manager..."
-sudo curl -fsSL -o "$BIN_PATH" "$REPO_URL/aiot_manager.sh"
+sudo curl -fsSL -o "$BIN_PATH" "$REPO_URL/aiot_manager"
 sudo chmod +x "$BIN_PATH"
 echo "[OK] /usr/local/bin/aiot-manager 등록 완료"
 
